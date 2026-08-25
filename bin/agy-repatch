@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Re-apply Antigravity CLI (agy) region patches. Run after `agy update`."""
+from __future__ import annotations
+import hashlib, os, re, shutil, sys
+from pathlib import Path
+
+home = Path.home()
+_default = home / ".local/bin/agy.real"
+if not _default.is_file():
+    _default = home / ".local/bin/agy"
+SRC = Path(os.environ.get("AGY_BIN", str(_default)))
+BAK = SRC.with_name(SRC.name + ".agybak")
+TMP = SRC.with_name(SRC.name + ".new")
+
+def sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def apply_regex_fix(data: bytearray, sig: bytes, patched: bytes, fix: bytes, offset: int, label: str, all_hits=True) -> int:
+    cre = re.compile(sig, re.S)
+    pre = re.compile(patched, re.S)
+    already = list(pre.finditer(data))
+    hits = list(cre.finditer(data))
+    print(f"[{label}] unpatched={len(hits)} already={len(already)}")
+    if not hits:
+        if already:
+            return 0
+        raise SystemExit(f"[{label}] signature not found — unsupported agy build")
+    n = 0
+    for m in reversed(hits):
+        off = m.start() + offset
+        data[off:off + len(fix)] = fix
+        print(f"  patched 0x{off:x}")
+        n += 1
+        if not all_hits:
+            break
+    return n
+
+WRAPPER = home / ".local/bin/agy"
+REAL = home / ".local/bin/agy.real"
+WRAPPER_SRC = r'''#!/usr/bin/env bash
+REAL="${AGY_REAL:-$HOME/.local/bin/agy.real}"
+if [[ ! -x "$REAL" ]]; then
+  echo "agy.real not found at $REAL" >&2
+  exit 127
+fi
+
+# confeden-style: only CloudCode is steered to a substituting proxy.
+if ! timeout 0.2 bash -c 'echo >/dev/tcp/127.0.0.1/18080' 2>/dev/null; then
+  nohup "$HOME/.local/bin/agy-cloudcode-proxy" >/tmp/agy-cloudcode-proxy.log 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    timeout 0.2 bash -c 'echo >/dev/tcp/127.0.0.1/18080' 2>/dev/null && break
+    sleep 0.05
+  done
+fi
+export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:18080}"
+export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:18080}"
+export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
+export CLOUD_CODE_URL="${CLOUD_CODE_URL:-https://daily-cloudcode-pa.googleapis.com}"
+exec "$REAL" "$@"
+'''
+
+def ensure_real_binary():
+    """If updater overwrote the wrapper with a fresh ELF, move it to agy.real."""
+    global SRC
+    agy = WRAPPER
+    if agy.is_file():
+        with agy.open("rb") as f:
+            magic = f.read(4)
+        if magic == b"\x7fELF":
+            print("agy is a fresh ELF (update overwrote wrapper) -> agy.real")
+            shutil.copy2(agy, REAL)
+            SRC = REAL
+    if not SRC.is_file() and REAL.is_file():
+        SRC = REAL
+
+def write_wrapper():
+    WRAPPER.write_text(WRAPPER_SRC)
+    os.chmod(WRAPPER, 0o755)
+    print("wrapper restored ->", WRAPPER)
+
+ensure_real_binary()
+if not SRC.is_file():
+    sys.exit(f"agy not found: {SRC}")
+
+print("target", SRC, "size", SRC.stat().st_size)
+print("sha256", sha256(SRC))
+data = bytearray(SRC.read_bytes())
+n = 0
+n += apply_regex_fix(
+    data,
+    rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85....",
+    rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85....",
+    b"\x48\x85\xc0\x90",
+    9, "CLI eligibility", True,
+)
+n += apply_regex_fix(
+    data,
+    rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
+    rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
+    b"\xc6\x40\x08\x01\x90\x90",
+    0, "hasValidAuth", False,
+)
+for old, new in (
+    (b"\n\nineligible\x18\x03", b"\n\ninexigible\x18\x03"),
+    (b"name=ineligible,proto3,oneof", b"name=inexigible,proto3,oneof"),
+):
+    c = bytes(data).count(old)
+    print(f"[proto] {old!r} -> {c}")
+    if c:
+        data = bytearray(bytes(data).replace(old, new))
+        n += c
+
+if n:
+    if not BAK.exists() or BAK.stat().st_size != SRC.stat().st_size:
+        print("backup ->", BAK)
+        shutil.copy2(SRC, BAK)
+    TMP.write_bytes(data)
+    os.chmod(TMP, 0o755)
+    try:
+        SRC.unlink()
+    except OSError as e:
+        print("unlink:", e)
+    os.replace(TMP, SRC)
+    os.chmod(SRC, 0o755)
+    print("sha256 after", sha256(SRC))
+else:
+    print("binary already patched")
+
+write_wrapper()
+print("OK, restart agy")

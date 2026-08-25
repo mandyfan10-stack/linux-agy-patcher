@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Local CONNECT proxy: CloudCode hosts go to geohide SNI proxies, everything else is direct.
+
+Mirrors confeden/Antigravity v2.9.1_29 DNS substitution + TLS passthrough,
+without their unpublished relay. No cert MITM.
+"""
+from __future__ import annotations
+
+import select
+import socket
+import threading
+
+LISTEN = ("127.0.0.1", 18080)
+TIMEOUT = 8
+
+# geohide.ru answers for daily-cloudcode-pa (measured 2026-08-25, RU IP).
+# Order is probed at connect time; dead/slow addresses are skipped.
+CLOUDCODE_IPS = [
+    "95.182.120.241",
+    "45.155.204.190",
+    "37.230.192.51",
+]
+CLOUDCODE_HOSTS = {
+    "daily-cloudcode-pa.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+}
+
+
+def _pipe(a: socket.socket, b: socket.socket) -> None:
+    try:
+        while True:
+            r, _, _ = select.select([a, b], [], [], 120)
+            if not r:
+                break
+            for src in r:
+                dst = b if src is a else a
+                data = src.recv(65536)
+                if not data:
+                    return
+                dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+def _dial(host: str, port: int) -> socket.socket:
+    last_err: Exception | None = None
+    targets = CLOUDCODE_IPS if host in CLOUDCODE_HOSTS else [host]
+    for ip in targets:
+        try:
+            s = socket.create_connection((ip, port), timeout=TIMEOUT)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return s
+        except OSError as e:
+            last_err = e
+            continue
+    raise last_err or OSError("no targets")
+
+
+def _handle(client: socket.socket) -> None:
+    client.settimeout(15)
+    try:
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 8192:
+            chunk = client.recv(1024)
+            if not chunk:
+                client.close()
+                return
+            buf += chunk
+        line = buf.split(b"\r\n", 1)[0].decode("ascii", "replace")
+        parts = line.split()
+        if len(parts) < 2 or parts[0].upper() != "CONNECT":
+            client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+            client.close()
+            return
+        hostport = parts[1]
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            port = int(port_s)
+        else:
+            host, port = hostport, 443
+        leftover = buf.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in buf else b""
+        try:
+            upstream = _dial(host, port)
+        except OSError:
+            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+            client.close()
+            return
+        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        if leftover:
+            upstream.sendall(leftover)
+        client.settimeout(None)
+        upstream.settimeout(None)
+        t = threading.Thread(target=_pipe, args=(client, upstream), daemon=True)
+        t.start()
+        t.join()
+    except OSError:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+def main() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(LISTEN)
+    srv.listen(64)
+    while True:
+        client, _ = srv.accept()
+        threading.Thread(target=_handle, args=(client,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
