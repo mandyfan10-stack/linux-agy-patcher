@@ -1,0 +1,7 @@
+[Unit]
+Description=Re-patch agy after an official update
+After=agy-cloudcode-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agy-repatch

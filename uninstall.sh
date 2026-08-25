@@ -4,9 +4,13 @@ BIN="${HOME}/.local/bin"
 UNIT_DIR="${HOME}/.config/systemd/user"
 
 if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user disable --now agy-watchdog.path 2>/dev/null || true
+  systemctl --user stop agy-watchdog.service 2>/dev/null || true
   systemctl --user disable --now agy-cloudcode-proxy.service 2>/dev/null || true
 fi
-rm -f "$UNIT_DIR/agy-cloudcode-proxy.service"
+rm -f "$UNIT_DIR/agy-cloudcode-proxy.service" \
+      "$UNIT_DIR/agy-watchdog.service" \
+      "$UNIT_DIR/agy-watchdog.path"
 pkill -f "$BIN/agy-cloudcode-proxy" 2>/dev/null || true
 
 restore=""
@@ -24,5 +28,5 @@ if [[ -n "$restore" ]]; then
   echo "восстановлен $BIN/agy из $restore"
 fi
 
-rm -f "$BIN/agy-cloudcode-proxy" "$BIN/agy-repatch" "$BIN/agy.real"
-echo "прокси и обёртка сняты. бэкап *.agybak не удалялся."
+rm -f "$BIN/agy-cloudcode-proxy" "$BIN/agy-repatch" "$BIN/agy-patcher" "$BIN/agy.real"
+echo "прокси, watchdog и обёртка сняты. бэкап *.agybak не удалялся."

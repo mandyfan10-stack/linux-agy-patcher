@@ -24,10 +24,16 @@ FAILED_PRECONDITION (code 400): User location is not supported for the API use.
 1. Байт-патч `agy` (eligibility + `hasValidAuth` + protobuf `ineligible` → `inexigible`).
 2. Оригинал сохраняется как `~/.local/bin/agy.agybak`, рабочий ELF — `~/.local/bin/agy.real`.
 3. `~/.local/bin/agy` становится обёрткой: `HTTPS_PROXY` + `CLOUD_CODE_URL`.
-4. Локальный CONNECT-прокси `127.0.0.1:18080`: только CloudCode → IP geohide, остальное напрямую.
-5. user systemd-сервис `agy-cloudcode-proxy.service`.
+4. Локальный CONNECT-прокси `127.0.0.1:18080`: гонка DNS (geohide / xbox-dns / comss против 8.8.8.8), только **подмена**, плюс HTTP health-check `loadCodeAssist`; иначе напрямую.
+5. user systemd: `agy-cloudcode-proxy.service` и `agy-watchdog.path` (перепатч после `agy update`).
 
 Браузер, curl и прочие программы **не** получают системный прокси.
+
+```bash
+agy-patcher status   # обёртка, патч, прокси, watchdog
+agy-patcher probe    # CONNECT + loadCodeAssist, ловит 400 location
+agy-repatch          # вручную после апдейта
+```
 
 ## Установка
 
@@ -42,7 +48,7 @@ chmod +x install.sh uninstall.sh
 
 Закройте текущий `agy` и запустите заново.
 
-После `agy update`:
+После `agy update` watchdog перепатчит сам; иначе:
 
 ```bash
 agy-repatch
@@ -56,11 +62,11 @@ agy-repatch
 
 ## Ограничения
 
-- Сигнатуры проверены на **agy 1.1.20 linux-amd64**. Другая версия: патчер откажется менять файл, если байты не найдены.
-- geohide иногда меняет/глушит адреса — прокси перебирает три IP. Если все умрут, снова будет 400.
-- «Быстрый релей» confeden сюда не входит (его нет в публичном git).
-- ARM64-сигнатуры AvenCores в этот репозиторий не переносились.
+- Сигнатуры проверены на **agy 1.1.20 linux-amd64**.
+- geohide иногда глушит адреса — прокси гоняет провайдеров и проверяет `loadCodeAssist`.
+- «Быстрый релей» confeden сюда не входит.
+- ARM64-сигнатуры не переносились.
 
 ## Лицензия
 
-[GNU GPL v3](LICENSE) — как у [open-antigravity-patcher](https://github.com/AvenCores/open-antigravity-patcher), откуда взяты байт-сигнатуры.
+[GNU GPL v3](LICENSE) — как у [open-antigravity-patcher](https://github.com/AvenCores/open-antigravity-patcher).

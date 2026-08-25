@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch agy binary for official updates
+
+[Path]
+PathChanged=%h/.local/bin/agy
+PathChanged=%h/.local/bin/agy.real
+Unit=agy-watchdog.service
+
+[Install]
+WantedBy=default.target
