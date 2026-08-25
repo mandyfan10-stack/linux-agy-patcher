@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Re-apply Antigravity CLI (agy) region patches. Run after `agy update`."""
 from __future__ import annotations
-import hashlib, os, re, shutil, sys
+import fcntl, hashlib, os, re, shutil, sys
 from pathlib import Path
 
 home = Path.home()
@@ -11,6 +11,19 @@ if not _default.is_file():
 SRC = Path(os.environ.get("AGY_BIN", str(_default)))
 BAK = SRC.with_name(SRC.name + ".agybak")
 TMP = SRC.with_name(SRC.name + ".new")
+LOCK_DIR = home / ".cache" / "linux-agy-patcher"
+LOCK_PATH = LOCK_DIR / "repatch.lock"
+WRAPPER = home / ".local/bin/agy"
+REAL = home / ".local/bin/agy.real"
+HERE = Path(__file__).resolve().parent
+
+
+def acquire_lock():
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
 
 def sha256(p: Path) -> str:
     h = hashlib.sha256()
@@ -18,6 +31,7 @@ def sha256(p: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
 
 def apply_regex_fix(data: bytearray, sig: bytes, patched: bytes, fix: bytes, offset: int, label: str, all_hits=True) -> int:
     cre = re.compile(sig, re.S)
@@ -28,7 +42,8 @@ def apply_regex_fix(data: bytearray, sig: bytes, patched: bytes, fix: bytes, off
     if not hits:
         if already:
             return 0
-        raise SystemExit(f"[{label}] signature not found — unsupported agy build")
+        print(f"[{label}] signature not found — unsupported agy build")
+        return -1
     n = 0
     for m in reversed(hits):
         off = m.start() + offset
@@ -39,71 +54,97 @@ def apply_regex_fix(data: bytearray, sig: bytes, patched: bytes, fix: bytes, off
             break
     return n
 
-WRAPPER = home / ".local/bin/agy"
-REAL = home / ".local/bin/agy.real"
-WRAPPER_SRC = r'''#!/usr/bin/env bash
-REAL="${AGY_REAL:-$HOME/.local/bin/agy.real}"
-if [[ ! -x "$REAL" ]]; then
-  echo "agy.real not found at $REAL" >&2
-  exit 127
-fi
 
-# confeden-style: only CloudCode is steered to a substituting proxy.
-if ! timeout 0.2 bash -c 'echo >/dev/tcp/127.0.0.1/18080' 2>/dev/null; then
-  nohup "$HOME/.local/bin/agy-cloudcode-proxy" >/tmp/agy-cloudcode-proxy.log 2>&1 &
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    timeout 0.2 bash -c 'echo >/dev/tcp/127.0.0.1/18080' 2>/dev/null && break
-    sleep 0.05
-  done
-fi
-export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:18080}"
-export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:18080}"
-export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
-export CLOUD_CODE_URL="${CLOUD_CODE_URL:-https://daily-cloudcode-pa.googleapis.com}"
-exec "$REAL" "$@"
-'''
+def load_wrapper_src() -> str:
+    env = os.environ.get("AGY_WRAPPER_SRC")
+    candidates = [
+        Path(env) if env else None,
+        HERE / "agy-wrapper.tmpl",
+        HERE / "agy-wrapper",
+        home / ".local/bin/agy-wrapper.tmpl",
+    ]
+    for p in candidates:
+        if p is None or not p.is_file():
+            continue
+        try:
+            with p.open("rb") as f:
+                if f.read(4) == b"\x7fELF":
+                    continue
+            text = p.read_text()
+        except OSError:
+            continue
+        if "agy.real" in text and '== "update"' in text:
+            print("wrapper template", p)
+            return text
+    sys.exit("agy-wrapper.tmpl not found (re-run install.sh)")
+
 
 def ensure_real_binary():
     """If updater overwrote the wrapper with a fresh ELF, move it to agy.real."""
     global SRC
-    agy = WRAPPER
-    if agy.is_file():
-        with agy.open("rb") as f:
+    if WRAPPER.is_file():
+        with WRAPPER.open("rb") as f:
             magic = f.read(4)
         if magic == b"\x7fELF":
             print("agy is a fresh ELF (update overwrote wrapper) -> agy.real")
-            shutil.copy2(agy, REAL)
+            shutil.copy2(WRAPPER, REAL)
             SRC = REAL
     if not SRC.is_file() and REAL.is_file():
         SRC = REAL
 
-def write_wrapper():
-    WRAPPER.write_text(WRAPPER_SRC)
+
+def write_wrapper(src: str):
+    if WRAPPER.is_file():
+        with WRAPPER.open("rb") as f:
+            magic = f.read(4)
+        if magic != b"\x7fELF":
+            try:
+                if WRAPPER.read_text() == src:
+                    print("wrapper already in place")
+                    return
+            except UnicodeDecodeError:
+                pass
+    WRAPPER.write_text(src)
     os.chmod(WRAPPER, 0o755)
     print("wrapper restored ->", WRAPPER)
 
+
+_lock_fd = acquire_lock()
 ensure_real_binary()
 if not SRC.is_file():
     sys.exit(f"agy not found: {SRC}")
+
+wrapper_src = load_wrapper_src()
+# Restore wrapper before patching so a signature miss still leaves the proxy path.
+write_wrapper(wrapper_src)
 
 print("target", SRC, "size", SRC.stat().st_size)
 print("sha256", sha256(SRC))
 data = bytearray(SRC.read_bytes())
 n = 0
-n += apply_regex_fix(
+miss = 0
+r = apply_regex_fix(
     data,
     rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85....",
     rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85....",
     b"\x48\x85\xc0\x90",
     9, "CLI eligibility", True,
 )
-n += apply_regex_fix(
+if r < 0:
+    miss += 1
+else:
+    n += r
+r = apply_regex_fix(
     data,
     rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
     rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
     b"\xc6\x40\x08\x01\x90\x90",
     0, "hasValidAuth", False,
 )
+if r < 0:
+    miss += 1
+else:
+    n += r
 for old, new in (
     (b"\n\nineligible\x18\x03", b"\n\ninexigible\x18\x03"),
     (b"name=ineligible,proto3,oneof", b"name=inexigible,proto3,oneof"),
@@ -128,7 +169,8 @@ if n:
     os.chmod(SRC, 0o755)
     print("sha256 after", sha256(SRC))
 else:
-    print("binary already patched")
+    print("binary already patched" if not miss else "binary unchanged (signatures missed)")
 
-write_wrapper()
 print("OK, restart agy")
+if miss:
+    sys.exit(1)
