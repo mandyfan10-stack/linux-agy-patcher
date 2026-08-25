@@ -17,4 +17,15 @@ export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:18080}"
 export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:18080}"
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
 export CLOUD_CODE_URL="${CLOUD_CODE_URL:-https://daily-cloudcode-pa.googleapis.com}"
+
+# Stay in this process after `agy update`: the running script survives even if
+# the updater replaces this file. Then restore the wrapper and re-patch.
+if [[ "${1:-}" == "update" ]]; then
+  "$REAL" "$@"
+  _rc=$?
+  if [[ -x "$HOME/.local/bin/agy-repatch" ]]; then
+    "$HOME/.local/bin/agy-repatch" || true
+  fi
+  exit "$_rc"
+fi
 exec "$REAL" "$@"

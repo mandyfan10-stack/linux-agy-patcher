@@ -4,4 +4,6 @@ After=agy-cloudcode-proxy.service
 
 [Service]
 Type=oneshot
+Nice=10
+TimeoutStartSec=120
 ExecStart=%h/.local/bin/agy-repatch
