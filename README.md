@@ -24,7 +24,7 @@ FAILED_PRECONDITION (code 400): User location is not supported for the API use.
 1. Байт-патч `agy` (eligibility + `hasValidAuth` + protobuf `ineligible` → `inexigible`).
 2. Оригинал сохраняется как `~/.local/bin/agy.agybak`, рабочий ELF — `~/.local/bin/agy.real`.
 3. `~/.local/bin/agy` становится обёрткой: `HTTPS_PROXY` + `CLOUD_CODE_URL`.
-4. Локальный CONNECT-прокси `127.0.0.1:18080`: гонка DNS (geohide / xbox-dns / comss против 8.8.8.8), только **подмена**, плюс TLS+SNI probe; иначе напрямую. Живой IP липкий, коннект — кто ответил первым, мёртвые отваливаются за ~1 с.
+4. Локальный CONNECT-прокси `127.0.0.1:18080`: гонка DNS (geohide / xbox-dns / comss против 8.8.8.8), только **подмена**, плюс TLS+SNI probe; иначе напрямую. Живой IP липкий, коннект — кто ответил первым. Простой туннель не режется (как confeden v2.9.1_30), мёртвый край — карантин 5 мин.
 5. user systemd: `agy-cloudcode-proxy.service`, `agy-watchdog.path` (`PathModified` на `agy`/`agy.real`) и `agy-watchdog.timer` (раз в 5 минут).
 6. Обёртка перехватывает `agy update`: запускает настоящий апдейт, затем `agy-repatch` — даже если апдейтер затёр сам скрипт (процесс bash уже в памяти). Шаблон обёртки лежит отдельно (`agy-wrapper.tmpl`), апдейтер его не трогает.
 
