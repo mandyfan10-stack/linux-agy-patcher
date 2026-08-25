@@ -24,7 +24,7 @@ FAILED_PRECONDITION (code 400): User location is not supported for the API use.
 1. Байт-патч `agy` (eligibility + `hasValidAuth` + protobuf `ineligible` → `inexigible`).
 2. Оригинал сохраняется как `~/.local/bin/agy.agybak`, рабочий ELF — `~/.local/bin/agy.real`.
 3. `~/.local/bin/agy` становится обёрткой: `HTTPS_PROXY` + `CLOUD_CODE_URL`.
-4. Локальный CONNECT-прокси `127.0.0.1:18080`: гонка DNS (geohide / xbox-dns / comss против 8.8.8.8), только **подмена**, плюс TLS+SNI probe; иначе напрямую.
+4. Локальный CONNECT-прокси `127.0.0.1:18080`: гонка DNS (geohide / xbox-dns / comss против 8.8.8.8), только **подмена**, плюс TLS+SNI probe; иначе напрямую. Живой IP липкий, коннект — кто ответил первым, мёртвые отваливаются за ~1 с.
 5. user systemd: `agy-cloudcode-proxy.service`, `agy-watchdog.path` (`PathModified` на `agy`/`agy.real`) и `agy-watchdog.timer` (раз в 5 минут).
 6. Обёртка перехватывает `agy update`: запускает настоящий апдейт, затем `agy-repatch` — даже если апдейтер затёр сам скрипт (процесс bash уже в памяти). Шаблон обёртки лежит отдельно (`agy-wrapper.tmpl`), апдейтер его не трогает.
 
@@ -64,7 +64,7 @@ agy-repatch
 ## Ограничения
 
 - Сигнатуры проверены на **agy 1.1.20 linux-amd64**. Другая версия: обёртка всё равно восстановится, байт-патч пропустит неизвестные сигнатуры.
-- geohide иногда меняет/глушит адреса — прокси перебирает три IP. Если все умрут, снова будет 400.
+- geohide иногда меняет/глушит адреса — прокси держит липкий живой IP и параллельно пробует `45.155.204.190` / `37.230.192.51`. Если все умрут, снова будет 400.
 - «Быстрый релей» confeden сюда не входит (его нет в публичном git).
 - ARM64-сигнатуры AvenCores в этот репозиторий не переносились.
 
