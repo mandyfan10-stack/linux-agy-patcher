@@ -24,8 +24,9 @@ FAILED_PRECONDITION (code 400): User location is not supported for the API use.
 1. Байт-патч `agy` (eligibility + `hasValidAuth` + protobuf `ineligible` → `inexigible`).
 2. Оригинал сохраняется как `~/.local/bin/agy.agybak`, рабочий ELF — `~/.local/bin/agy.real`.
 3. `~/.local/bin/agy` становится обёрткой: `HTTPS_PROXY` + `CLOUD_CODE_URL`.
-4. Локальный CONNECT-прокси `127.0.0.1:18080`: гонка DNS (geohide / xbox-dns / comss против 8.8.8.8), только **подмена**, плюс HTTP health-check `loadCodeAssist`; иначе напрямую.
-5. user systemd: `agy-cloudcode-proxy.service` и `agy-watchdog.path` (перепатч после `agy update`).
+4. Локальный CONNECT-прокси `127.0.0.1:18080`: гонка DNS (geohide / xbox-dns / comss против 8.8.8.8), только **подмена**, плюс TLS+SNI probe; иначе напрямую.
+5. user systemd: `agy-cloudcode-proxy.service`, `agy-watchdog.path` (`PathModified` на `agy`/`agy.real`) и `agy-watchdog.timer` (раз в 5 минут).
+6. Обёртка перехватывает `agy update`: запускает настоящий апдейт, затем `agy-repatch` — даже если апдейтер затёр сам скрипт (процесс bash уже в памяти).
 
 Браузер, curl и прочие программы **не** получают системный прокси.
 
@@ -48,7 +49,7 @@ chmod +x install.sh uninstall.sh
 
 Закройте текущий `agy` и запустите заново.
 
-После `agy update` watchdog перепатчит сам; иначе:
+После `agy update` обёртка сама вызывает `agy-repatch`. Если апдейт обошёл обёртку (`agy.real update`, in-place truncate), сработают `PathModified` или таймер. Вручную:
 
 ```bash
 agy-repatch
@@ -62,11 +63,11 @@ agy-repatch
 
 ## Ограничения
 
-- Сигнатуры проверены на **agy 1.1.20 linux-amd64**.
-- geohide иногда глушит адреса — прокси гоняет провайдеров и проверяет `loadCodeAssist`.
-- «Быстрый релей» confeden сюда не входит.
-- ARM64-сигнатуры не переносились.
+- Сигнатуры проверены на **agy 1.1.20 linux-amd64**. Другая версия: обёртка всё равно восстановится, байт-патч пропустит неизвестные сигнатуры.
+- geohide иногда меняет/глушит адреса — прокси перебирает три IP. Если все умрут, снова будет 400.
+- «Быстрый релей» confeden сюда не входит (его нет в публичный git).
+- ARM64-сигнатуры AvenCores в этот репозиторий не переносились.
 
 ## Лицензия
 
-[GNU GPL v3](LICENSE) — как у [open-antigravity-patcher](https://github.com/AvenCores/open-antigravity-patcher).
+[GNU GPL v3](LICENSE) — как у [open-antigravity-patcher](https://github.com/AvenCores/open-antigravity-patcher), откуда взяты байт-сигнатуры.

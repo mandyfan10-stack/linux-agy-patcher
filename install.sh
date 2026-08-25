@@ -30,6 +30,7 @@ install -m 0755 "$ROOT/bin/agy-patcher" "$BIN/agy-patcher"
 install -m 0644 "$ROOT/systemd/agy-cloudcode-proxy.service" "$UNIT_DIR/agy-cloudcode-proxy.service"
 install -m 0644 "$ROOT/systemd/agy-watchdog.service" "$UNIT_DIR/agy-watchdog.service"
 install -m 0644 "$ROOT/systemd/agy-watchdog.path" "$UNIT_DIR/agy-watchdog.path"
+install -m 0644 "$ROOT/systemd/agy-watchdog.timer" "$UNIT_DIR/agy-watchdog.timer"
 
 if [[ "$(readlink -f "$agy_path")" != "$(readlink -f "$BIN/agy.real")" ]]; then
   if [[ -f "$BIN/agy.real" ]] && file -b "$BIN/agy.real" | grep -q ELF; then
@@ -50,6 +51,7 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl --user enable agy-cloudcode-proxy.service
   systemctl --user restart agy-cloudcode-proxy.service
   systemctl --user enable --now agy-watchdog.path
+  systemctl --user enable --now agy-watchdog.timer
 fi
 
 echo
@@ -59,5 +61,5 @@ echo "Проверка CloudCode через прокси..."
 "$BIN/agy-patcher" probe || true
 echo
 echo "Готово. Если agy уже запущен — закройте и откройте снова."
-echo "После 'agy update' watchdog перепатчит сам; иначе: agy-repatch"
+echo "После 'agy update' обёртка сразу вызывает agy-repatch; path+timer — запасной путь."
 echo "Статус: agy-patcher status"
