@@ -20,6 +20,7 @@ REPATCH = BIN / "agy-repatch"
 UNIT = "agy-cloudcode-proxy.service"
 WATCH_PATH = "agy-watchdog.path"
 WATCH_UNIT = "agy-watchdog.service"
+WATCH_TIMER = "agy-watchdog.timer"
 
 CLI_U = re.compile(rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85....", re.S)
 CLI_P = re.compile(rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85....", re.S)
@@ -79,10 +80,13 @@ def cmd_status() -> int:
     print("agy wrapper :", WRAP, wrap_kind)
     print("agy.real    :", "yes" if _elf(REAL) else "missing")
     print("backup      :", "yes" if BAK.is_file() else "missing")
+    tmpl = BIN / "agy-wrapper.tmpl"
     print("proxy bin   :", "yes" if PROXY.is_file() else "missing")
+    print("wrapper tmpl:", "yes" if tmpl.is_file() else "missing")
     print("proxy :18080:", "up" if _listening(18080) else "down")
     print("systemd     :", UNIT, _unit_active(UNIT))
     print("watchdog    :", WATCH_PATH, _unit_active(WATCH_PATH))
+    print("timer       :", WATCH_TIMER, _unit_active(WATCH_TIMER))
     target = REAL if _elf(REAL) else WRAP
     st = _patches(target)
     if not st.get("elf"):
