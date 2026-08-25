@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+REAL="${AGY_REAL:-$HOME/.local/bin/agy.real}"
+if [[ ! -x "$REAL" ]]; then
+  echo "agy.real not found at $REAL" >&2
+  exit 127
+fi
+
+# confeden-style: only CloudCode is steered to a substituting proxy.
+if ! timeout 0.2 bash -c 'echo >/dev/tcp/127.0.0.1/18080' 2>/dev/null; then
+  nohup "$HOME/.local/bin/agy-cloudcode-proxy" >/tmp/agy-cloudcode-proxy.log 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    timeout 0.2 bash -c 'echo >/dev/tcp/127.0.0.1/18080' 2>/dev/null && break
+    sleep 0.05
+  done
+fi
+export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:18080}"
+export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:18080}"
+export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
+export CLOUD_CODE_URL="${CLOUD_CODE_URL:-https://daily-cloudcode-pa.googleapis.com}"
+exec "$REAL" "$@"

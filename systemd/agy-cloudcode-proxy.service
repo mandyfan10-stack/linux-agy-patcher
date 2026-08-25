@@ -1,0 +1,11 @@
+[Unit]
+Description=agy CloudCode geohide CONNECT proxy
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/agy-cloudcode-proxy
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
