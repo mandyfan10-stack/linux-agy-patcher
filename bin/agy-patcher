@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""linux-agy-patcher CLI: status / probe / repatch."""
+from __future__ import annotations
+
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+BIN = HOME / ".local" / "bin"
+REAL = BIN / "agy.real"
+WRAP = BIN / "agy"
+BAK = BIN / "agy.agybak"
+PROXY = BIN / "agy-cloudcode-proxy"
+REPATCH = BIN / "agy-repatch"
+UNIT = "agy-cloudcode-proxy.service"
+WATCH_PATH = "agy-watchdog.path"
+WATCH_UNIT = "agy-watchdog.service"
+
+CLI_U = re.compile(rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85....", re.S)
+CLI_P = re.compile(rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85....", re.S)
+MGR_U = re.compile(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60", re.S)
+MGR_P = re.compile(rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60", re.S)
+
+
+def _elf(p: Path) -> bool:
+    if not p.is_file():
+        return False
+    with p.open("rb") as f:
+        return f.read(4) == b"\x7fELF"
+
+
+def _unit_active(name: str) -> str:
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return (r.stdout or r.stderr or "").strip() or "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return "no-systemd"
+
+
+def _listening(port: int) -> bool:
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=0.3)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _patches(p: Path) -> dict:
+    if not _elf(p):
+        return {"file": str(p), "elf": False}
+    data = p.read_bytes()
+    return {
+        "file": str(p),
+        "elf": True,
+        "size": len(data),
+        "eligibility_patched": len(list(CLI_P.finditer(data))),
+        "eligibility_unpatched": len(list(CLI_U.finditer(data))),
+        "hasValidAuth_patched": len(list(MGR_P.finditer(data))),
+        "hasValidAuth_unpatched": len(list(MGR_U.finditer(data))),
+        "inexigible": data.count(b"inexigible"),
+    }
+
+
+def cmd_status() -> int:
+    wrap_kind = "missing"
+    if WRAP.is_file():
+        wrap_kind = "elf" if _elf(WRAP) else "script"
+    print("agy wrapper :", WRAP, wrap_kind)
+    print("agy.real    :", "yes" if _elf(REAL) else "missing")
+    print("backup      :", "yes" if BAK.is_file() else "missing")
+    print("proxy bin   :", "yes" if PROXY.is_file() else "missing")
+    print("proxy :18080:", "up" if _listening(18080) else "down")
+    print("systemd     :", UNIT, _unit_active(UNIT))
+    print("watchdog    :", WATCH_PATH, _unit_active(WATCH_PATH))
+    target = REAL if _elf(REAL) else WRAP
+    st = _patches(target)
+    if not st.get("elf"):
+        print("binary      : not an ELF (updater overwrote wrapper?)")
+        return 1
+    ok = (
+        st["eligibility_unpatched"] == 0
+        and st["eligibility_patched"] >= 1
+        and st["hasValidAuth_unpatched"] == 0
+        and st["hasValidAuth_patched"] >= 1
+    )
+    print(
+        "binary patch:",
+        "ok" if ok else "needed",
+        f"elig {st['eligibility_patched']}/un {st['eligibility_unpatched']}",
+        f"auth {st['hasValidAuth_patched']}/un {st['hasValidAuth_unpatched']}",
+        f"inexigible={st['inexigible']}",
+    )
+    state = HOME / ".cache" / "linux-agy-patcher" / "state.log"
+    if state.is_file():
+        last = state.read_text(errors="replace").strip().splitlines()
+        if last:
+            print("last route  :", last[-1])
+    return 0 if ok and _listening(18080) and wrap_kind == "script" else 1
+
+
+def cmd_probe() -> int:
+    host = "daily-cloudcode-pa.googleapis.com"
+    try:
+        sock = socket.create_connection(("127.0.0.1", 18080), timeout=20)
+        sock.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            buf += chunk
+        if b"200" not in buf.split(b"\r\n", 1)[0]:
+            print("CONNECT failed:", buf[:200])
+            return 1
+        ctx = ssl.create_default_context()
+        ss = ctx.wrap_socket(sock, server_hostname=host)
+        ss.sendall(
+            b"POST /v1internal:loadCodeAssist HTTP/1.1\r\n"
+            b"Host: " + host.encode() + b"\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n\r\n{}"
+        )
+        resp = b""
+        while True:
+            chunk = ss.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        ss.close()
+    except OSError as e:
+        print("probe error:", e)
+        return 1
+    head = resp.split(b"\r\n", 1)[0].decode("latin1", "replace")
+    body = resp.split(b"\r\n\r\n", 1)[-1][:300].decode("utf-8", "replace")
+    print("http:", head)
+    if "User location is not supported" in body:
+        print("FAIL location 400 still present")
+        print(body[:200])
+        return 2
+    if "401" in head or "200" in head:
+        print("ok: CloudCode via proxy (auth expected to be 401 without token, 200 with)")
+        return 0
+    print(body[:200])
+    return 0
+
+
+def cmd_repatch() -> int:
+    if not REPATCH.is_file():
+        print("agy-repatch not installed", file=sys.stderr)
+        return 1
+    os.execv(str(REPATCH), [str(REPATCH)])
+
+
+def main() -> int:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd in ("-h", "--help", "help"):
+        print("agy-patcher [status|probe|repatch]")
+        return 0
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "probe":
+        return cmd_probe()
+    if cmd == "repatch":
+        return cmd_repatch()
+    print("unknown command", cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
