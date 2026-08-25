@@ -2,8 +2,8 @@
 """CONNECT proxy for agy CloudCode.
 
 Race unblock DNS (geohide / xbox-dns / comss) against 8.8.8.8/1.1.1.1,
-keep only substituted answers, probe CloudCode HTTP, then tunnel.
-Everything else is a direct CONNECT. No cert MITM.
+keep only substituted answers, probe TLS+SNI, then tunnel. Everything else
+is a direct CONNECT. No cert MITM.
 
 Strategy from confeden/Antigravity v2.9.1_29 src/resolvers.rs.
 """
@@ -22,12 +22,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 LISTEN = ("127.0.0.1", int(os.environ.get("AGY_PROXY_PORT", "18080")))
-CONNECT_TIMEOUT = 4
+CONNECT_TIMEOUT = 1.25
 DNS_TIMEOUT = 0.7
-TLS_BUDGET = 3.0
-CACHE_TTL = 30.0
-STALE_TTL = 300.0
-WARM_EVERY = 20.0
+TLS_BUDGET = 1.5
+CACHE_TTL = 180.0
+STALE_TTL = 900.0
+WARM_EVERY = 45.0
 
 CLOUDCODE_HOSTS = {
     "daily-cloudcode-pa.googleapis.com",
@@ -35,6 +35,7 @@ CLOUDCODE_HOSTS = {
     "generativelanguage.googleapis.com",
 }
 
+# confeden src/resolvers.rs PROVIDERS + REFERENCE_V4
 PROVIDERS: list[tuple[str, tuple[str, ...]]] = [
     ("geohide.ru", ("45.155.204.190", "37.230.192.51")),
     ("xbox-dns.ru", ("111.88.96.50", "111.88.96.51")),
@@ -42,11 +43,17 @@ PROVIDERS: list[tuple[str, tuple[str, ...]]] = [
 ]
 REFERENCE = ("8.8.8.8", "1.1.1.1")
 REFERENCE_STUBS = {ipaddress.IPv4Address("8.6.112.0"), ipaddress.IPv4Address("8.47.69.0")}
-FALLBACK = ("95.182.120.241", "45.155.204.190", "37.230.192.51")
+# 95.182.120.241 timed out from RU (Aug 2026) — do not dial it
+FALLBACK = ("45.155.204.190", "37.230.192.51")
 
 log = logging.getLogger("agy-proxy")
 _cache_lock = threading.Lock()
+# host -> (ips, provider, t_monotonic)
 _cache: dict[str, tuple[list[str], str, float]] = {}
+_sticky: dict[str, str] = {}
+_inflight: dict[str, threading.Event] = {}
+_inflight_lock = threading.Lock()
+_last_route: tuple | None = None
 _state_path = os.path.expanduser("~/.cache/linux-agy-patcher/state.log")
 
 
@@ -58,6 +65,15 @@ def _log_line(msg: str) -> None:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
     except OSError:
         pass
+
+
+def _log_route(name: str, provider: str, ips: list[str]) -> None:
+    global _last_route
+    key = (name, provider, tuple(ips))
+    if key == _last_route:
+        return
+    _last_route = key
+    _log_line(f"{name} via {provider} -> {','.join(ips)}")
 
 
 def _block16(ip: str) -> tuple[int, int]:
@@ -108,13 +124,15 @@ def _parse_a(resp: bytes) -> list[str]:
 
 
 def _src_ip() -> str | None:
+    """Prefer a non-tunnel IPv4 so unblock DNS still sees a RU client."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 53))
             ip = s.getsockname()[0]
     except OSError:
         return None
-    if ip.startswith(("172.19.", "10.0.", "198.18.")):
+    skip = ip.startswith("172.19.") or ip.startswith("10.0.") or ip.startswith("198.18.")
+    if skip:
         return None
     return ip
 
@@ -138,10 +156,30 @@ def _dns_query(server: str, name: str, src: str | None) -> list[str]:
         sock.close()
 
 
+def _uniq(seq: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    for x in seq:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def _with_sticky(name: str, ips: list[str]) -> list[str]:
+    stick = _sticky.get(name)
+    if stick and stick in ips:
+        return [stick] + [i for i in ips if i != stick]
+    return list(ips)
+
+
 def _reference(name: str, src: str | None) -> list[str]:
     addrs: list[str] = []
-    for server in REFERENCE:
-        addrs.extend(_dns_query(server, name, src))
+    with ThreadPoolExecutor(max_workers=len(REFERENCE)) as pool:
+        futs = [pool.submit(_dns_query, server, name, src) for server in REFERENCE]
+        for fut in as_completed(futs):
+            try:
+                addrs.extend(fut.result())
+            except Exception:
+                pass
     clean = []
     for a in addrs:
         try:
@@ -165,8 +203,10 @@ def _is_substituted(candidate: Iterable[str], reference: list[str]) -> bool:
 
 
 def _http_ok(ip: str, sni: str, budget: float = TLS_BUDGET) -> bool:
+    """True if CloudCode answers HTTP (401/200), not RST/EOF/location 400."""
     try:
-        raw = socket.create_connection((ip, 443), timeout=min(1.0, budget))
+        raw = socket.create_connection((ip, 443), timeout=min(0.9, budget))
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         raw.settimeout(budget)
         ctx = ssl.create_default_context()
         ss = ctx.wrap_socket(raw, server_hostname=sni)
@@ -187,10 +227,56 @@ def _http_ok(ip: str, sni: str, budget: float = TLS_BUDGET) -> bool:
         ss.close()
     except OSError:
         return False
-    if not data or b"User location is not supported" in data:
+    if not data:
+        return False
+    if b"User location is not supported" in data:
         return False
     head = data.split(b"\r\n", 1)[0]
     return b"401" in head or b"200" in head or b"403" in head
+
+
+def _first_tcp_ok(ips: list[str], timeout: float = 0.9) -> list[str]:
+    if not ips:
+        return []
+    live: list[str] = []
+    lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=min(4, len(ips))) as pool:
+        futs = {pool.submit(_tcp_alive, ip, 443, timeout): ip for ip in ips}
+        try:
+            for fut in as_completed(futs, timeout=timeout + 0.2):
+                ip = futs[fut]
+                try:
+                    ok = fut.result()
+                except Exception:
+                    ok = False
+                if ok:
+                    with lock:
+                        live.append(ip)
+        except TimeoutError:
+            pass
+    return live
+
+
+def _first_http_ok(ips: list[str], sni: str) -> list[str]:
+    if not ips:
+        return []
+    live: list[str] = []
+    lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=min(4, len(ips))) as pool:
+        futs = {pool.submit(_http_ok, ip, sni): ip for ip in ips}
+        try:
+            for fut in as_completed(futs, timeout=TLS_BUDGET + 0.4):
+                ip = futs[fut]
+                try:
+                    ok = fut.result()
+                except Exception:
+                    ok = False
+                if ok:
+                    with lock:
+                        live.append(ip)
+        except TimeoutError:
+            pass
+    return live
 
 
 def _race(name: str) -> tuple[list[str], str]:
@@ -211,21 +297,18 @@ def _race(name: str) -> tuple[list[str], str]:
             except Exception:
                 pass
     for pname, _servers in PROVIDERS:
-        seen = []
-        for ip in grouped[pname]:
-            if ip not in seen:
-                seen.append(ip)
+        seen = _uniq(grouped[pname])
         if not seen:
             continue
         if _is_substituted(seen, ref):
-            live = [ip for ip in seen if _http_ok(ip, name)]
+            live = _first_tcp_ok(seen)
             if live:
                 return live, pname
             if not best:
                 best, best_name = seen, pname
         else:
             log.debug("%s passthrough for %s -> %s", pname, name, seen)
-    live = [ip for ip in FALLBACK if _http_ok(ip, name)]
+    live = _first_tcp_ok(list(FALLBACK))
     if live:
         return live, "fallback-geohide"
     if best:
@@ -233,24 +316,65 @@ def _race(name: str) -> tuple[list[str], str]:
     return list(FALLBACK), "fallback-unproven"
 
 
-def resolve_cloudcode(name: str) -> list[str]:
-    now = time.monotonic()
+def _rank_http(name: str, ips: list[str]) -> None:
+    """Prefer IPs that actually answer CloudCode HTTP; does not block CONNECT."""
+    live = _first_http_ok(_uniq(list(ips) + list(FALLBACK)), name)
+    if not live:
+        return
+    cur = _sticky.get(name)
+    if cur not in live:
+        _sticky[name] = live[0]
     with _cache_lock:
         hit = _cache.get(name)
-        if hit and now - hit[2] < CACHE_TTL:
-            return hit[0]
-        stale = hit if hit and now - hit[2] < STALE_TTL else None
+        if hit:
+            ordered = _uniq(live + [i for i in hit[0] if i not in live])
+            _cache[name] = (ordered, hit[1], hit[2])
+
+
+def _refresh(name: str) -> list[str]:
+    with _inflight_lock:
+        ev = _inflight.get(name)
+        mine = ev is None
+        if mine:
+            ev = threading.Event()
+            _inflight[name] = ev
+    if not mine:
+        ev.wait(8)
+        with _cache_lock:
+            hit = _cache.get(name)
+        return list(hit[0]) if hit else list(FALLBACK)
     try:
         ips, provider = _race(name)
+        ips = _uniq(ips)
         with _cache_lock:
             _cache[name] = (ips, provider, time.monotonic())
-        _log_line(f"{name} via {provider} -> {','.join(ips)}")
+        _log_route(name, provider, ips)
+        threading.Thread(target=_rank_http, args=(name, ips), daemon=True).start()
         return ips
     except Exception as e:
         log.warning("race failed for %s: %s", name, e)
-        if stale:
-            return stale[0]
+        with _cache_lock:
+            hit = _cache.get(name)
+        if hit:
+            return list(hit[0])
         return list(FALLBACK)
+    finally:
+        with _inflight_lock:
+            _inflight.pop(name, None)
+        ev.set()
+
+
+def resolve_cloudcode(name: str, force: bool = False) -> list[str]:
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(name)
+        if not force and hit and now - hit[2] < CACHE_TTL:
+            return _with_sticky(name, hit[0])
+        stale = hit if hit and now - hit[2] < STALE_TTL else None
+    if not force and stale:
+        threading.Thread(target=_refresh, args=(name,), daemon=True).start()
+        return _with_sticky(name, stale[0])
+    return _with_sticky(name, _refresh(name))
 
 
 def _pipe(a: socket.socket, b: socket.socket) -> None:
@@ -279,18 +403,78 @@ def _pipe(a: socket.socket, b: socket.socket) -> None:
                 pass
 
 
+def _tcp_alive(ip: str, port: int = 443, timeout: float = 0.7) -> bool:
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _dial_fast(ips: list[str], port: int, timeout: float) -> tuple[socket.socket, str]:
+    """Staggered happy eyeballs: first TCP that completes wins; extras are closed."""
+    if not ips:
+        raise OSError("no targets")
+    if len(ips) == 1:
+        s = socket.create_connection((ips[0], port), timeout=timeout)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return s, ips[0]
+    lock = threading.Lock()
+    winner: list[tuple[socket.socket, str]] = []
+    errors: list[BaseException] = []
+    done = threading.Event()
+
+    def one(ip: str) -> None:
+        if done.is_set():
+            return
+        try:
+            s = socket.create_connection((ip, port), timeout=timeout)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            errors.append(e)
+            return
+        with lock:
+            if not winner:
+                winner.append((s, ip))
+                done.set()
+                return
+        try:
+            s.close()
+        except OSError:
+            pass
+
+    threads: list[threading.Thread] = []
+    for ip in ips:
+        t = threading.Thread(target=one, args=(ip,), daemon=True)
+        threads.append(t)
+        t.start()
+        if done.wait(0.05):
+            break
+    if not done.wait(timeout + 0.2):
+        pass
+    if winner:
+        return winner[0]
+    raise errors[-1] if errors else OSError("connect timed out")
+
+
 def _dial(host: str, port: int) -> socket.socket:
     last_err: Exception | None = None
-    targets = resolve_cloudcode(host) if host in CLOUDCODE_HOSTS else [host]
-    for ip in targets:
+    if host in CLOUDCODE_HOSTS:
+        targets = _uniq(_with_sticky(host, resolve_cloudcode(host) + list(FALLBACK)))
         try:
-            s = socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            return s
+            sock, ip = _dial_fast(targets, port, CONNECT_TIMEOUT)
+            _sticky[host] = ip
+            return sock
         except OSError as e:
             last_err = e
-            continue
-    raise last_err or OSError("no targets")
+            targets = _uniq(_with_sticky(host, resolve_cloudcode(host, force=True) + list(FALLBACK)))
+            sock, ip = _dial_fast(targets, port, CONNECT_TIMEOUT)
+            _sticky[host] = ip
+            return sock
+    s = socket.create_connection((host, port), timeout=4)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return s
 
 
 def _handle(client: socket.socket) -> None:
@@ -338,9 +522,19 @@ def _handle(client: socket.socket) -> None:
 
 
 def _warm() -> None:
+    name = "daily-cloudcode-pa.googleapis.com"
     while True:
         try:
-            resolve_cloudcode("daily-cloudcode-pa.googleapis.com")
+            ip = _sticky.get(name)
+            if ip and _tcp_alive(ip):
+                with _cache_lock:
+                    hit = _cache.get(name)
+                    if hit:
+                        _cache[name] = (hit[0], hit[1], time.monotonic())
+            else:
+                if ip:
+                    _sticky.pop(name, None)
+                resolve_cloudcode(name, force=True)
         except Exception as e:
             log.warning("warm: %s", e)
         time.sleep(WARM_EVERY)
