@@ -27,6 +27,7 @@ fi
 install -m 0755 "$ROOT/bin/agy-cloudcode-proxy" "$BIN/agy-cloudcode-proxy"
 install -m 0755 "$ROOT/bin/agy-repatch" "$BIN/agy-repatch"
 install -m 0755 "$ROOT/bin/agy-patcher" "$BIN/agy-patcher"
+install -m 0644 "$ROOT/bin/agy-wrapper" "$BIN/agy-wrapper.tmpl"
 install -m 0644 "$ROOT/systemd/agy-cloudcode-proxy.service" "$UNIT_DIR/agy-cloudcode-proxy.service"
 install -m 0644 "$ROOT/systemd/agy-watchdog.service" "$UNIT_DIR/agy-watchdog.service"
 install -m 0644 "$ROOT/systemd/agy-watchdog.path" "$UNIT_DIR/agy-watchdog.path"

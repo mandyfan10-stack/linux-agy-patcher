@@ -30,5 +30,5 @@ if [[ -n "$restore" ]]; then
   echo "восстановлен $BIN/agy из $restore"
 fi
 
-rm -f "$BIN/agy-cloudcode-proxy" "$BIN/agy-repatch" "$BIN/agy-patcher" "$BIN/agy.real"
+rm -f "$BIN/agy-cloudcode-proxy" "$BIN/agy-repatch" "$BIN/agy-patcher" "$BIN/agy.real" "$BIN/agy-wrapper.tmpl"
 echo "прокси, watchdog и обёртка сняты. бэкап *.agybak не удалялся."
