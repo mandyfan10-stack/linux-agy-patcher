@@ -1,29 +1,256 @@
 #!/usr/bin/env python3
-"""Local CONNECT proxy: CloudCode hosts go to geohide SNI proxies, everything else is direct.
+"""CONNECT proxy for agy CloudCode.
 
-Mirrors confeden/Antigravity v2.9.1_29 DNS substitution + TLS passthrough,
-without their unpublished relay. No cert MITM.
+Race unblock DNS (geohide / xbox-dns / comss) against 8.8.8.8/1.1.1.1,
+keep only substituted answers, probe CloudCode HTTP, then tunnel.
+Everything else is a direct CONNECT. No cert MITM.
+
+Strategy from confeden/Antigravity v2.9.1_29 src/resolvers.rs.
 """
 from __future__ import annotations
 
+import ipaddress
+import logging
+import os
 import select
 import socket
+import ssl
+import struct
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Iterable
 
-LISTEN = ("127.0.0.1", 18080)
-TIMEOUT = 8
+LISTEN = ("127.0.0.1", int(os.environ.get("AGY_PROXY_PORT", "18080")))
+CONNECT_TIMEOUT = 4
+DNS_TIMEOUT = 0.7
+TLS_BUDGET = 3.0
+CACHE_TTL = 30.0
+STALE_TTL = 300.0
+WARM_EVERY = 20.0
 
-# geohide.ru answers for daily-cloudcode-pa (measured 2026-08-25, RU IP).
-# Order is probed at connect time; dead/slow addresses are skipped.
-CLOUDCODE_IPS = [
-    "95.182.120.241",
-    "45.155.204.190",
-    "37.230.192.51",
-]
 CLOUDCODE_HOSTS = {
     "daily-cloudcode-pa.googleapis.com",
     "cloudcode-pa.googleapis.com",
+    "generativelanguage.googleapis.com",
 }
+
+PROVIDERS: list[tuple[str, tuple[str, ...]]] = [
+    ("geohide.ru", ("45.155.204.190", "37.230.192.51")),
+    ("xbox-dns.ru", ("111.88.96.50", "111.88.96.51")),
+    ("comss.one", ("83.220.169.155", "212.109.195.93", "195.133.25.16")),
+]
+REFERENCE = ("8.8.8.8", "1.1.1.1")
+REFERENCE_STUBS = {ipaddress.IPv4Address("8.6.112.0"), ipaddress.IPv4Address("8.47.69.0")}
+FALLBACK = ("95.182.120.241", "45.155.204.190", "37.230.192.51")
+
+log = logging.getLogger("agy-proxy")
+_cache_lock = threading.Lock()
+_cache: dict[str, tuple[list[str], str, float]] = {}
+_state_path = os.path.expanduser("~/.cache/linux-agy-patcher/state.log")
+
+
+def _log_line(msg: str) -> None:
+    log.info(msg)
+    try:
+        os.makedirs(os.path.dirname(_state_path), exist_ok=True)
+        with open(_state_path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def _block16(ip: str) -> tuple[int, int]:
+    a = ipaddress.ip_address(ip)
+    if isinstance(a, ipaddress.IPv4Address):
+        n = int(a)
+        return (4, n & 0xFFFF0000)
+    o = a.packed
+    return (6, (o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3])
+
+
+def _build_query(name: str, qid: int = 0x5A5A) -> bytes:
+    q = struct.pack(">H", qid) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    for label in name.split("."):
+        raw = label.encode("ascii")
+        q += bytes([len(raw)]) + raw
+    q += b"\x00" + struct.pack(">HH", 1, 1)
+    return q
+
+
+def _parse_a(resp: bytes) -> list[str]:
+    if len(resp) < 12:
+        return []
+    ancount = struct.unpack(">H", resp[4:6])[0]
+    i = 12
+    while i < len(resp) and resp[i] != 0:
+        i += 1 + resp[i]
+    i += 5
+    out: list[str] = []
+    for _ in range(ancount):
+        if i >= len(resp):
+            break
+        if resp[i] & 0xC0 == 0xC0:
+            i += 2
+        else:
+            while i < len(resp) and resp[i] != 0:
+                i += 1 + resp[i]
+            i += 1
+        if i + 10 > len(resp):
+            break
+        typ, _cls, _ttl, rdlen = struct.unpack(">HHIH", resp[i : i + 10])
+        i += 10
+        rdata = resp[i : i + rdlen]
+        i += rdlen
+        if typ == 1 and rdlen == 4:
+            out.append(socket.inet_ntoa(rdata))
+    return out
+
+
+def _src_ip() -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 53))
+            ip = s.getsockname()[0]
+    except OSError:
+        return None
+    if ip.startswith(("172.19.", "10.0.", "198.18.")):
+        return None
+    return ip
+
+
+def _dns_query(server: str, name: str, src: str | None) -> list[str]:
+    q = _build_query(name)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(DNS_TIMEOUT)
+    try:
+        if src:
+            try:
+                sock.bind((src, 0))
+            except OSError:
+                pass
+        sock.sendto(q, (server, 53))
+        data, _ = sock.recvfrom(4096)
+        return _parse_a(data)
+    except OSError:
+        return []
+    finally:
+        sock.close()
+
+
+def _reference(name: str, src: str | None) -> list[str]:
+    addrs: list[str] = []
+    for server in REFERENCE:
+        addrs.extend(_dns_query(server, name, src))
+    clean = []
+    for a in addrs:
+        try:
+            ip = ipaddress.ip_address(a)
+        except ValueError:
+            continue
+        if ip in REFERENCE_STUBS:
+            continue
+        clean.append(a)
+    return clean
+
+
+def _is_substituted(candidate: Iterable[str], reference: list[str]) -> bool:
+    cands = list(candidate)
+    if not cands or not reference:
+        return False
+    ref_blocks = {_block16(a) for a in reference}
+    if any(_block16(a) in ref_blocks for a in cands):
+        return False
+    return True
+
+
+def _http_ok(ip: str, sni: str, budget: float = TLS_BUDGET) -> bool:
+    try:
+        raw = socket.create_connection((ip, 443), timeout=min(1.0, budget))
+        raw.settimeout(budget)
+        ctx = ssl.create_default_context()
+        ss = ctx.wrap_socket(raw, server_hostname=sni)
+        req = (
+            b"POST /v1internal:loadCodeAssist HTTP/1.1\r\n"
+            b"Host: " + sni.encode("ascii") + b"\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n\r\n{}"
+        )
+        ss.sendall(req)
+        data = b""
+        while len(data) < 256:
+            chunk = ss.recv(256)
+            if not chunk:
+                break
+            data += chunk
+        ss.close()
+    except OSError:
+        return False
+    if not data or b"User location is not supported" in data:
+        return False
+    head = data.split(b"\r\n", 1)[0]
+    return b"401" in head or b"200" in head or b"403" in head
+
+
+def _race(name: str) -> tuple[list[str], str]:
+    src = _src_ip()
+    ref = _reference(name, src)
+    best: list[str] = []
+    best_name = ""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {}
+        for pname, servers in PROVIDERS:
+            for server in servers:
+                futs[pool.submit(_dns_query, server, name, src)] = pname
+        grouped: dict[str, list[str]] = {p: [] for p, _ in PROVIDERS}
+        for fut in as_completed(futs):
+            pname = futs[fut]
+            try:
+                grouped[pname].extend(fut.result())
+            except Exception:
+                pass
+    for pname, _servers in PROVIDERS:
+        seen = []
+        for ip in grouped[pname]:
+            if ip not in seen:
+                seen.append(ip)
+        if not seen:
+            continue
+        if _is_substituted(seen, ref):
+            live = [ip for ip in seen if _http_ok(ip, name)]
+            if live:
+                return live, pname
+            if not best:
+                best, best_name = seen, pname
+        else:
+            log.debug("%s passthrough for %s -> %s", pname, name, seen)
+    live = [ip for ip in FALLBACK if _http_ok(ip, name)]
+    if live:
+        return live, "fallback-geohide"
+    if best:
+        return best, best_name + "(no-live-tls)"
+    return list(FALLBACK), "fallback-unproven"
+
+
+def resolve_cloudcode(name: str) -> list[str]:
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(name)
+        if hit and now - hit[2] < CACHE_TTL:
+            return hit[0]
+        stale = hit if hit and now - hit[2] < STALE_TTL else None
+    try:
+        ips, provider = _race(name)
+        with _cache_lock:
+            _cache[name] = (ips, provider, time.monotonic())
+        _log_line(f"{name} via {provider} -> {','.join(ips)}")
+        return ips
+    except Exception as e:
+        log.warning("race failed for %s: %s", name, e)
+        if stale:
+            return stale[0]
+        return list(FALLBACK)
 
 
 def _pipe(a: socket.socket, b: socket.socket) -> None:
@@ -54,10 +281,10 @@ def _pipe(a: socket.socket, b: socket.socket) -> None:
 
 def _dial(host: str, port: int) -> socket.socket:
     last_err: Exception | None = None
-    targets = CLOUDCODE_IPS if host in CLOUDCODE_HOSTS else [host]
+    targets = resolve_cloudcode(host) if host in CLOUDCODE_HOSTS else [host]
     for ip in targets:
         try:
-            s = socket.create_connection((ip, port), timeout=TIMEOUT)
+            s = socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             return s
         except OSError as e:
@@ -110,11 +337,23 @@ def _handle(client: socket.socket) -> None:
             pass
 
 
+def _warm() -> None:
+    while True:
+        try:
+            resolve_cloudcode("daily-cloudcode-pa.googleapis.com")
+        except Exception as e:
+            log.warning("warm: %s", e)
+        time.sleep(WARM_EVERY)
+
+
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(LISTEN)
     srv.listen(64)
+    _log_line(f"listen {LISTEN[0]}:{LISTEN[1]}")
+    threading.Thread(target=_warm, daemon=True).start()
     while True:
         client, _ = srv.accept()
         threading.Thread(target=_handle, args=(client,), daemon=True).start()
