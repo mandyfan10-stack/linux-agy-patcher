@@ -6,7 +6,7 @@
 
 ## Стратегия обхода 400 «User location is not supported»
 
-**[confeden/Antigravity](https://github.com/confeden/Antigravity)** (релизы вплоть до v2.9.1_33, 25 Aug 2026)
+**[confeden/Antigravity](https://github.com/confeden/Antigravity)** (релизы вплоть до v2.10.0_3, 26 Aug 2026)
 
 Репозиторий: https://github.com/confeden/Antigravity  
 Релизы: https://github.com/confeden/Antigravity/releases
@@ -21,6 +21,7 @@
 - Детекция подмены DNS: ответ сравнивается с 8.8.8.8 / 1.1.1.1; `172.217.x` — настоящий Google, не прокси.
 - Список провайдеров из `src/resolvers.rs`: xbox-dns.ru, comss.one, geohide.ru.
 - v2.9.1_30–33: не закрывать простой туннель (пул Antigravity / «размышление» модели), карантин мёртвого края на 5 минут, не держать медленный маршрут после восстановления.
+- v2.10.0_3: keepalive до 10 с простоя (иначе IDE крутит Authenticating), не доверять IP, который только принимает TCP и молчит, быстрый failover вместо 15 с.
 
 Их «быстрый маршрут» (закрытый релей и ключ) **в этот репозиторий не входит** — в публичные исходники confeden его тоже не кладут.
 
