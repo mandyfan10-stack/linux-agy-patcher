@@ -22,12 +22,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 LISTEN = ("127.0.0.1", int(os.environ.get("AGY_PROXY_PORT", "18080")))
-CONNECT_TIMEOUT = 1.25
+CONNECT_TIMEOUT = 0.9
 DNS_TIMEOUT = 0.7
 TLS_BUDGET = 1.5
 CACHE_TTL = 180.0
 STALE_TTL = 900.0
 WARM_EVERY = 45.0
+# confeden v2.9.1_30/31/33: idle 90s killed Antigravity's pool; ban a dead edge 5 min
+QUARANTINE_SEC = 300.0
 
 CLOUDCODE_HOSTS = {
     "daily-cloudcode-pa.googleapis.com",
@@ -54,6 +56,8 @@ _sticky: dict[str, str] = {}
 _inflight: dict[str, threading.Event] = {}
 _inflight_lock = threading.Lock()
 _last_route: tuple | None = None
+_quarantine: dict[str, float] = {}
+_q_lock = threading.Lock()
 _state_path = os.path.expanduser("~/.cache/linux-agy-patcher/state.log")
 
 
@@ -166,9 +170,37 @@ def _uniq(seq: Iterable[str]) -> list[str]:
 
 def _with_sticky(name: str, ips: list[str]) -> list[str]:
     stick = _sticky.get(name)
+    if stick and _is_banned(stick):
+        _sticky.pop(name, None)
+        stick = None
     if stick and stick in ips:
         return [stick] + [i for i in ips if i != stick]
     return list(ips)
+
+
+def _is_banned(ip: str) -> bool:
+    with _q_lock:
+        until = _quarantine.get(ip)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            _quarantine.pop(ip, None)
+            return False
+        return True
+
+
+def _usable(ips: list[str]) -> list[str]:
+    ok = [i for i in ips if not _is_banned(i)]
+    return ok or list(ips)
+
+
+def _ban(ip: str, why: str) -> None:
+    with _q_lock:
+        _quarantine[ip] = time.monotonic() + QUARANTINE_SEC
+    for host, stick in list(_sticky.items()):
+        if stick == ip:
+            _sticky.pop(host, None)
+    _log_line(f"quarantine {ip} {int(QUARANTINE_SEC)}s ({why})")
 
 
 def _reference(name: str, src: str | None) -> list[str]:
@@ -206,7 +238,7 @@ def _http_ok(ip: str, sni: str, budget: float = TLS_BUDGET) -> bool:
     """True if CloudCode answers HTTP (401/200), not RST/EOF/location 400."""
     try:
         raw = socket.create_connection((ip, 443), timeout=min(0.9, budget))
-        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _tune(raw)
         raw.settimeout(budget)
         ctx = ssl.create_default_context()
         ss = ctx.wrap_socket(raw, server_hostname=sni)
@@ -303,14 +335,21 @@ def _race(name: str) -> tuple[list[str], str]:
         if _is_substituted(seen, ref):
             live = _first_tcp_ok(seen)
             if live:
-                return live, pname
-            if not best:
-                best, best_name = seen, pname
+                # v2.10.0_3: an IP can accept TCP and then stay silent
+                http = _first_http_ok(live, name)
+                if http:
+                    return http, pname
+                if not best:
+                    best, best_name = live, pname + "(tcp-only)"
+                continue
         else:
             log.debug("%s passthrough for %s -> %s", pname, name, seen)
     live = _first_tcp_ok(list(FALLBACK))
     if live:
-        return live, "fallback-geohide"
+        http = _first_http_ok(live, name)
+        if http:
+            return http, "fallback-geohide"
+        return live, "fallback-geohide(tcp-only)"
     if best:
         return best, best_name + "(no-live-tls)"
     return list(FALLBACK), "fallback-unproven"
@@ -377,22 +416,34 @@ def resolve_cloudcode(name: str, force: bool = False) -> list[str]:
     return _with_sticky(name, _refresh(name))
 
 
-def _pipe(a: socket.socket, b: socket.socket) -> None:
+def _pipe(client: socket.socket, upstream: socket.socket) -> tuple[str, int, int]:
+    """Copy until a peer closes. Do not kill idle tunnels (confeden v2.9.1_30)."""
+    c2u = 0
+    u2c = 0
+    reason = "eof"
     try:
         while True:
-            r, _, _ = select.select([a, b], [], [], 120)
-            if not r:
+            r, _, x = select.select([client, upstream], [], [client, upstream], 60)
+            if x:
+                reason = "error"
                 break
+            if not r:
+                continue
             for src in r:
-                dst = b if src is a else a
+                dst = upstream if src is client else client
                 data = src.recv(65536)
                 if not data:
-                    return
+                    reason = "client-eof" if src is client else "upstream-eof"
+                    return reason, c2u, u2c
+                if src is client:
+                    c2u += len(data)
+                else:
+                    u2c += len(data)
                 dst.sendall(data)
-    except OSError:
-        pass
+    except OSError as e:
+        reason = f"oserror:{getattr(e, 'errno', e)}"
     finally:
-        for s in (a, b):
+        for s in (client, upstream):
             try:
                 s.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -401,6 +452,20 @@ def _pipe(a: socket.socket, b: socket.socket) -> None:
                 s.close()
             except OSError:
                 pass
+    return reason, c2u, u2c
+
+
+def _tune(s: socket.socket) -> None:
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    try:
+        # v2.10.0_3: Google/IDE dropped idle tunnels at ~10s; probe sooner
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 8)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+    except (OSError, AttributeError):
+        pass
 
 
 def _tcp_alive(ip: str, port: int = 443, timeout: float = 0.7) -> bool:
@@ -418,7 +483,7 @@ def _dial_fast(ips: list[str], port: int, timeout: float) -> tuple[socket.socket
         raise OSError("no targets")
     if len(ips) == 1:
         s = socket.create_connection((ips[0], port), timeout=timeout)
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _tune(s)
         return s, ips[0]
     lock = threading.Lock()
     winner: list[tuple[socket.socket, str]] = []
@@ -430,7 +495,7 @@ def _dial_fast(ips: list[str], port: int, timeout: float) -> tuple[socket.socket
             return
         try:
             s = socket.create_connection((ip, port), timeout=timeout)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            _tune(s)
         except OSError as e:
             errors.append(e)
             return
@@ -458,23 +523,21 @@ def _dial_fast(ips: list[str], port: int, timeout: float) -> tuple[socket.socket
     raise errors[-1] if errors else OSError("connect timed out")
 
 
-def _dial(host: str, port: int) -> socket.socket:
-    last_err: Exception | None = None
+def _dial(host: str, port: int) -> tuple[socket.socket, str | None]:
     if host in CLOUDCODE_HOSTS:
-        targets = _uniq(_with_sticky(host, resolve_cloudcode(host) + list(FALLBACK)))
+        targets = _usable(_uniq(_with_sticky(host, resolve_cloudcode(host) + list(FALLBACK))))
         try:
             sock, ip = _dial_fast(targets, port, CONNECT_TIMEOUT)
-            _sticky[host] = ip
-            return sock
-        except OSError as e:
-            last_err = e
-            targets = _uniq(_with_sticky(host, resolve_cloudcode(host, force=True) + list(FALLBACK)))
+            return sock, ip
+        except OSError:
+            targets = _usable(
+                _uniq(_with_sticky(host, resolve_cloudcode(host, force=True) + list(FALLBACK)))
+            )
             sock, ip = _dial_fast(targets, port, CONNECT_TIMEOUT)
-            _sticky[host] = ip
-            return sock
+            return sock, ip
     s = socket.create_connection((host, port), timeout=4)
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    return s
+    _tune(s)
+    return s, None
 
 
 def _handle(client: socket.socket) -> None:
@@ -501,7 +564,7 @@ def _handle(client: socket.socket) -> None:
             host, port = hostport, 443
         leftover = buf.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in buf else b""
         try:
-            upstream = _dial(host, port)
+            upstream, up_ip = _dial(host, port)
         except OSError:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
             client.close()
@@ -511,9 +574,22 @@ def _handle(client: socket.socket) -> None:
             upstream.sendall(leftover)
         client.settimeout(None)
         upstream.settimeout(None)
-        t = threading.Thread(target=_pipe, args=(client, upstream), daemon=True)
-        t.start()
-        t.join()
+        try:
+            _tune(client)
+        except OSError:
+            pass
+        reason, c2u, u2c = _pipe(client, upstream)
+        if up_ip and u2c >= 512:
+            _sticky[host] = up_ip
+        if (
+            up_ip
+            and c2u > 32
+            and u2c < 512
+            and (reason.startswith("upstream") or reason.startswith("oserror") or reason == "error")
+        ):
+            _ban(up_ip, f"{reason} c2u={c2u} u2c={u2c}")
+        elif reason not in ("client-eof", "upstream-eof"):
+            log.info("tunnel %s %s c2u=%s u2c=%s", host, reason, c2u, u2c)
     except OSError:
         try:
             client.close()
@@ -526,6 +602,9 @@ def _warm() -> None:
     while True:
         try:
             ip = _sticky.get(name)
+            if ip and _is_banned(ip):
+                _sticky.pop(name, None)
+                ip = None
             if ip and _tcp_alive(ip):
                 with _cache_lock:
                     hit = _cache.get(name)
