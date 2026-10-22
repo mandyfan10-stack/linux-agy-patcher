@@ -54,7 +54,9 @@ REFERENCE_STUBS = {ipaddress.IPv4Address("8.6.112.0"), ipaddress.IPv4Address("8.
 # 95.182.120.241 timed out from RU (Aug 2026) — do not dial it
 # dns-ai NL edge 186.246.45.126 accepted TCP but timed out TLS (31 Aug 2026);
 # keep it off FALLBACK so happy-eyeballs cannot pick a silent IP.
-FALLBACK = ("45.155.204.190", "37.230.192.51")
+# Oct 2026: geohide edges send upstream EOF after TLS; comss/xbox edges answer
+# CloudCode TLS, so they now lead the fallback list.
+FALLBACK = ("31.58.216.201", "85.137.95.145", "181.215.40.49", "45.155.204.190", "37.230.192.51")
 _DOT_CTX = ssl.create_default_context()
 
 log = logging.getLogger("agy-proxy")
