@@ -13,9 +13,14 @@ if ! timeout 0.2 bash -c 'echo >/dev/tcp/127.0.0.1/18080' 2>/dev/null; then
     sleep 0.05
   done
 fi
-export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:18080}"
-export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:18080}"
-export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
+# Proxy up -> steer through it (proxy races providers and picks a live edge).
+# Proxy down -> go direct: substituted addresses come from the /etc/hosts
+# DNS-pin written by antigravity-unlocker (sudo bash ~/Downloads/ag_unlocker_linux.sh).
+if timeout 0.2 bash -c 'echo >/dev/tcp/127.0.0.1/18080' 2>/dev/null; then
+  export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:18080}"
+  export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:18080}"
+  export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
+fi
 export CLOUD_CODE_URL="${CLOUD_CODE_URL:-https://daily-cloudcode-pa.googleapis.com}"
 
 # Stay in this process after `agy update`: the running script survives even if

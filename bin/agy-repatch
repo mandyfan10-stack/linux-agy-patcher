@@ -145,6 +145,17 @@ if r < 0:
     miss += 1
 else:
     n += r
+r = apply_regex_fix(
+    data,
+    rb"\x48\x85\xc0\x0f\x85....\x48\x85\xc9\x0f\x84....\x80\x79\x08\x00\x0f\x85....",
+    rb"\x48\x85\xc0\x0f\x85....\x48\x85\xc9\x0f\x84....\x48\x85\xc9\x90\x0f\x85....",
+    b"\x48\x85\xc9\x90",
+    18, "print-mode gate", True,
+)
+if r < 0:
+    miss += 1
+else:
+    n += r
 for old, new in (
     (b"\n\nineligible\x18\x03", b"\n\ninexigible\x18\x03"),
     (b"name=ineligible,proto3,oneof", b"name=inexigible,proto3,oneof"),
